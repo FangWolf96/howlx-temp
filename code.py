@@ -1,69 +1,80 @@
-import time
-import board
-import busio
+import time, math, board, busio
 from adafruit_bme280 import basic as adafruit_bme280
 
-# Create I2C once
+# -----------------------
+# Psychrometric helpers
+# -----------------------
+def dewpoint_c(temp_c, rh):
+    a, b = 17.62, 243.12
+    gamma = (a * temp_c) / (b + temp_c) + math.log(rh/100.0)
+    return (b * gamma) / (a - gamma)
+
+def wetbulb_c(temp_c, rh):
+    return temp_c*math.atan(0.151977*(rh+8.313659)**0.5) \
+           + math.atan(temp_c+rh) \
+           - math.atan(rh-1.676331) \
+           + 0.00391838*(rh**1.5)*math.atan(0.023101*rh) \
+           - 4.686035
+
+def humidity_ratio(temp_c, rh, pressure_hpa=1013.25):
+    es = 6.112*math.exp((17.67*temp_c)/(temp_c+243.5))
+    e = rh/100.0 * es
+    p = pressure_hpa
+    return 0.62198*e/(p-e)  # kg/kg
+
+def enthalpy(temp_c, w):
+    return 1.006*temp_c + w*(2501 + 1.805*temp_c)  # kJ/kg dry air
+
+# -----------------------
+# Sensor sanity check
+# -----------------------
 i2c = busio.I2C(board.SCL, board.SDA)
+sensor = None
 
-def wait_for_bme_address(i2c):
-    """Continuously scan I2C until 0x76 or 0x77 is found; return the address."""
-    print("Scanning for BME280 on I2C (looking for 0x76 or 0x77)...")
-    while True:
-        # lock, scan, unlock
-        while not i2c.try_lock():
-            pass
-        addrs = i2c.scan()
-        i2c.unlock()
+while sensor is None:
+    while not i2c.try_lock():
+        pass
+    addresses = [hex(x) for x in i2c.scan()]
+    i2c.unlock()
 
-        if addrs:
-            # Print once in a while to show progress
-            print("I2C addresses:", [hex(x) for x in addrs])
+    print("I2C scan:", addresses)
 
-        # Prefer 0x76 if both present; otherwise pick whichever is present
-        if 0x76 in addrs:
-            return 0x76
-        if 0x77 in addrs:
-            return 0x77
+    if "0x76" in addresses:
+        sensor = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
+        print("✅ BME280 found at 0x76")
+    elif "0x77" in addresses:
+        sensor = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x77)
+        print("✅ BME280 found at 0x77")
+    else:
+        print("❌ No BME280 found, retrying in 3s...")
+        time.sleep(3)
 
-        # Not found yet; wait a bit and try again
-        time.sleep(0.5)
+# -----------------------
+# Main loop: log only
+# -----------------------
+while True:
+    temp_c = sensor.temperature
+    rh     = sensor.relative_humidity
+    pressure = sensor.pressure
+    alt = sensor.altitude
 
-def init_bme(i2c, address):
-    """Try to initialize the BME280 at the provided address, retrying until it succeeds."""
-    while True:
-        try:
-            sensor = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=address)
-            return sensor
-        except ValueError:
-            # Could be a transient; re-check address in case wiring changed
-            print("Found expected address but init failed; rechecking bus...")
-            time.sleep(0.5)
-            addr = wait_for_bme_address(i2c)
-            address = addr  # update and try again
+    temp_f = temp_c*9/5+32
+    dp_c = dewpoint_c(temp_c, rh)
+    dp_f = dp_c*9/5+32
+    wb_c = wetbulb_c(temp_c, rh)
+    wb_f = wb_c*9/5+32
+    w = humidity_ratio(temp_c, rh, pressure)
+    h = enthalpy(temp_c, w)
 
-def main():
-    addr = wait_for_bme_address(i2c)
-    print("BME280 detected at:", hex(addr))
+    print("==== HowlX Readings ====")
+    print(f"Dry Bulb: {temp_c:.2f} °C / {temp_f:.2f} °F")
+    print(f"Dew Point: {dp_c:.2f} °C / {dp_f:.2f} °F")
+    print(f"Wet Bulb: {wb_c:.2f} °C / {wb_f:.2f} °F")
+    print(f"Humidity: {rh:.2f} %")
+    print(f"Pressure: {pressure:.2f} hPa")
+    print(f"Altitude: {alt:.2f} m")
+    print(f"Humidity Ratio: {w:.5f} kg/kg")
+    print(f"Enthalpy: {h:.2f} kJ/kg")
+    print("========================\n")
 
-    bme = init_bme(i2c, addr)
-
-    # Set your local sea-level pressure (hPa) for better altitude calculation
-    bme.sea_level_pressure = 1013.25
-
-    while True:
-        c = bme.temperature
-        f = c * 9.0/5.0 + 32.0
-        rh = bme.humidity
-        p = bme.pressure
-        alt = bme.altitude
-
-        print("Temp: {:.2f} °C / {:.2f} °F".format(c, f))
-        print("Humidity: {:.2f} %".format(rh))
-        print("Pressure: {:.2f} hPa".format(p))
-        print("Altitude: {:.2f} m".format(alt))
-        print("-----------------------------")
-        time.sleep(2)
-
-if __name__ == "__main__":
-    main()
+    time.sleep(10)
