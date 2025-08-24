@@ -1,5 +1,5 @@
 WIFI_SSID="SSID_Here"
 WIFI_PASSWORD="passwordhere"
-ADAFRUIT_AIO_USERNAME="badwolf96"
+ADAFRUIT_AIO_USERNAME="youruser"
 ADAFRUIT_AIO_KEY="aio_yourkeyhere"
 AIO_GROUP_KEY="your_group here"
