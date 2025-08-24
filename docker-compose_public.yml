@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+  emqx:
+    image: emqx/emqx:5
+    container_name: howlx_emqx
+    restart: unless-stopped
+    environment:
+      - EMQX_NODE_NAME=emqx@127.0.0.1
+    volumes:
+      - emqx_data:/opt/emqx/data
+      - emqx_log:/opt/emqx/log
+    # Expose only to localhost for host nginx upstreams
+    ports:
+      - "127.0.0.1:8083:8083"    # MQTT over WebSocket (nginx will proxy /mqtt/ here)
+      # Uncomment ONLY if you need local debug of raw MQTT TCP or EMQX UI:
+      # - "127.0.0.1:1883:1883"  # MQTT TCP (not used if you do WSS only)
+      # - "127.0.0.1:18083:18083" # EMQX Dashboard (put behind Cloudflare Access if exposed)
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: howlx_influxdb
+    restart: unless-stopped
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_INIT_USERNAME:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_INIT_PASSWORD:-change_me_now}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_INIT_ORG:-hvac}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_INIT_BUCKET:-sensors}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_INIT_TOKEN:-super_secret_influx_token}
+    volumes:
+      - influx_data:/var/lib/influxdb2
+    # Only bind to localhost so only host nginx / local tools can reach it
+    ports:
+      - "127.0.0.1:8086:8086"
+
+  telegraf:
+    image: telegraf:1.30
+    container_name: howlx_telegraf
+    restart: unless-stopped
+    depends_on:
+      - emqx
+      - influxdb
+    environment:
+      TELEGRAF_INFLUX_URL: http://influxdb:8086
+      TELEGRAF_INFLUX_ORG: ${INFLUX_INIT_ORG:-hvac}
+      TELEGRAF_INFLUX_BUCKET: ${INFLUX_INIT_BUCKET:-sensors}
+      TELEGRAF_INFLUX_TOKEN: ${INFLUX_INIT_TOKEN:-super_secret_influx_token}
+      MQTT_TOPIC_BASE: ${MQTT_TOPIC_BASE:-customers/+/+/+/telemetry}
+    volumes:
+      - telegraf_conf:/etc/telegraf
+    # We’ll drop the telegraf.conf via an init step (below)
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: howlx_grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-change_me_now}
+      - GF_SERVER_ROOT_URL=https://grafana.wolfco.io
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  emqx_data:
+  emqx_log:
+  influx_data:
+  telegraf_conf:
+  grafana_data:
