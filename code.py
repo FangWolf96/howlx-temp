@@ -1,9 +1,17 @@
-import time, math, ssl
-import board, busio
+# code.py — HowlX proto board (Feather ESP32-S2 + BME280 + MAX17048)
+# - Reads BME280 (0x76/0x77)
+# - Reads MAX17048 fuel gauge (0x36)
+# - Posts to Adafruit IO Group (batch)
+# - Infers charging/discharging/charged and persists last %/V across deep sleep
+
+import time, math, ssl, struct, supervisor
+import board
+import busio
 import wifi, socketpool
 import adafruit_requests
 from os import getenv
 from adafruit_bme280 import basic as adafruit_bme280
+import adafruit_max1704x
 
 # ---------- Settings ----------
 WIFI_SSID = getenv("WIFI_SSID")
@@ -13,7 +21,7 @@ AIO_KEY  = getenv("ADAFRUIT_AIO_KEY")
 AIO_GROUP = getenv("AIO_GROUP_KEY") or "howlx-proto-board-001"
 
 SLEEP_SECONDS = 300         # 5 minutes
-SEA_LEVEL_HPA = 1013.25     # set to your local sea-level pressure for better altitude
+SEA_LEVEL_HPA = 1013.25     # for better altitude calc
 
 # ---------- Psychrometric helpers ----------
 def dewpoint_c(temp_c, rh):
@@ -39,8 +47,10 @@ def humidity_ratio(temp_c, rh, pressure_hpa=1013.25):
 def enthalpy(temp_c, w):
     return 1.006 * temp_c + w * (2501 + 1.805 * temp_c)  # kJ/kg dry air
 
-# ---------- Read sensor BEFORE Wi-Fi (reduce self-heating) ----------
-i2c = busio.I2C(board.SCL, board.SDA)
+# ---------- I2C (use singleton to avoid "SCL in use") ----------
+i2c = board.I2C()
+
+# ---------- BME280: read BEFORE Wi-Fi ----------
 sensor = None
 while sensor is None:
     while not i2c.try_lock():
@@ -82,6 +92,78 @@ print(f"Humidity Ratio: {w:.5f} kg/kg")
 print(f"Enthalpy: {h:.2f} kJ/kg")
 print("========================")
 
+# ---------- Battery (MAX17048/49 @ 0x36) ----------
+fg = adafruit_max1704x.MAX17048(i2c)
+
+def usb_present():
+    # 1) Most reliable for ESP32-S2 in CircuitPython
+    try:
+        return bool(supervisor.runtime.usb_connected)
+    except Exception:
+        pass
+    # 2) Some boards expose VBUS presence via CPU
+    try:
+        import microcontroller
+        if hasattr(microcontroller.cpu, "vbus_present"):
+            return bool(microcontroller.cpu.vbus_present)
+    except Exception:
+        pass
+    # 3) Fallback: common sense pins if they exist
+    try:
+        import digitalio
+        for name in ("VBUS", "VBUS_SENSE", "VUSB", "5V"):
+            if hasattr(board, name):
+                pin = digitalio.DigitalInOut(getattr(board, name))
+                pin.switch_to_input()
+                lvl = pin.value
+                pin.deinit()
+                return bool(lvl)
+    except Exception:
+        pass
+    return None  # unknown
+
+# Smooth a couple samples to avoid instant sag/spikes
+time.sleep(0.1)
+v1, p1 = fg.cell_voltage, fg.cell_percent
+time.sleep(0.1)
+v2, p2 = fg.cell_voltage, fg.cell_percent
+vbat = (v1 + v2) / 2.0
+bpct = (p1 + p2) / 2.0
+usb = usb_present()
+
+# Pull last cycle's % and V from sleep_memory (if present)
+prev_pct = None
+prev_v   = None
+try:
+    import alarm
+    mem = alarm.sleep_memory
+    if len(mem) >= 8:
+        prev_pct, prev_v = struct.unpack("ff", bytes(mem[:8]))
+except Exception:
+    pass
+
+def infer_state(usb_present_flag, v_now, p_now, p_prev=None, v_prev=None):
+    if usb_present_flag is True:
+        # Near full?
+        if v_now >= 4.18 or p_now >= 99.0:
+            return "charged"
+        # Rising vs last wake?
+        if (p_prev is not None and (p_now - p_prev) > 0.05) or \
+           (v_prev is not None and (v_now - v_prev) > 0.01):
+            return "charging"
+        return "usb-present"
+    elif usb_present_flag is False:
+        return "discharging"
+    else:
+        # Unknown USB state → trend heuristic only
+        if (p_prev is not None and (p_now - p_prev) > 0.05) or \
+           (v_prev is not None and (v_now - v_prev) > 0.01):
+            return "charging"
+        return "discharging"
+
+charging_state = infer_state(usb, vbat, bpct, prev_pct, prev_v)
+print(f"Battery: {vbat:.3f} V | {bpct:.1f}% | state={charging_state}")
+
 # ---------- Wi-Fi + HTTP session ----------
 print("Connecting Wi-Fi…")
 wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
@@ -90,8 +172,6 @@ requests = adafruit_requests.Session(pool, ssl.create_default_context())
 print("Wi-Fi OK:", wifi.radio.ipv4_address)
 
 # ---------- Adafruit IO Group batch POST ----------
-# Endpoint: POST /api/v2/{username}/groups/{group_key}/data
-# Payload form: {"feeds":[{"key":"<feed-key>","value":...}, ...]}
 BASE = f"https://io.adafruit.com/api/v2/{AIO_USER}"
 URL  = f"{BASE}/groups/{AIO_GROUP}/data"
 HEADERS = {"X-AIO-Key": AIO_KEY, "Content-Type": "application/json"}
@@ -109,18 +189,29 @@ feeds_payload = {
         {"key": "altitude-m",            "value": round(alt_m, 2)},
         {"key": "humidity-ratio-kgkg",   "value": round(w, 5)},
         {"key": "enthalpy-kjkg",         "value": round(h, 2)},
+
+        # ---- Battery feeds ----
+        {"key": "battery-v",             "value": round(vbat, 3)},
+        {"key": "battery-pct",           "value": round(bpct, 1)},
+        {"key": "charging-state",        "value": charging_state},
     ]
 }
 
 try:
     r = requests.post(URL, json=feeds_payload, headers=HEADERS, timeout=15)
     print("AIO group POST status:", r.status_code)
-    # If 404, ensure the group and each feed key exist (exact spelling, hyphens only)
     r.close()
 except Exception as e:
     print("AIO POST failed:", e)
 
-# ---------- Deep sleep (best battery life) ----------
+# ---------- Persist latest battery values for next wake ----------
+try:
+    import alarm
+    alarm.sleep_memory[:8] = struct.pack("ff", float(bpct), float(vbat))
+except Exception:
+    pass
+
+# ---------- Deep sleep ----------
 try:
     import alarm
     print(f"Sleeping for {SLEEP_SECONDS} s…")

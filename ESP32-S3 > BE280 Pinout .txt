@@ -1,0 +1,24 @@
+ESP32-S2 → BME280 Pin Out
+
+VIN → Power input (3.3–5 V, has regulator onboard)
+
+3Vo → 3.3 V output from the regulator (ignore this, only needed if you power from VIN >3.3 V)
+
+GND → Ground
+
+SCK → Clock line → used as SCL in I²C, or SCK in SPI
+
+SDI → Data in/out → used as SDA in I²C, or MOSI in SPI
+
+SDO → Data out / address select (I²C address or MISO in SPI)
+
+CS → Chip Select (must be tied HIGH for I²C mode)
+
+| **BME280 Pin** | **ESP32-S2 Pin** | **Notes**                                                |
+| -------------- | ---------------- | -------------------------------------------------------- |
+| VIN            | 3.3 V            |                        								   |
+| GND            | GND              | Common ground                                            |
+| SCK            | SCL              | (use the pin labeled **SCL** on your board)              |
+| SDI            | SDA              | (use the pin labeled **SDA** on your board)              |
+| SDO            | GND              | Sets address to `0x76` (tie to 3.3 V if you want `0x77`) |
+| CS             | 3.3 V            | Tie HIGH to enable I²C mode                              |
