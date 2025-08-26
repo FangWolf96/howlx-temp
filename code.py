@@ -5,6 +5,7 @@
 # - Infers charging/discharging/charged and persists last %/V across deep sleep
 # - 2025-08-26 v1.0.1: Exception handling, watchdog, retries
 # -            v1.0.2: add calibration support and read for offset file
+# -            v1.0.3: Offset file fallback fetch (GitHub)
 
 import time, math, ssl, struct, supervisor, json
 import board
@@ -292,6 +293,65 @@ try:
     requests = adafruit_requests.Session(pool, ssl.create_default_context())
     print("Wi-Fi OK:", wifi.radio.ipv4_address)
     
+    # ---- Offset file fallback fetch (GitHub) ----
+    OFFSETS_GH_URL = "https://raw.githubusercontent.com/FangWolf96/howlx-temp/refs/heads/main/bme_offsets.json"
+
+    def _offsets_file_exists():
+        try:
+            import os
+            return "bme_offsets.json" in os.listdir("/")
+        except Exception:
+            return False
+
+    # Set via env INTEGRATED_SENSOR=1 (default 1). Set to 0 to skip remote fetch on this board.
+    INTEGRATED_SENSOR = (getenv("INTEGRATED_SENSOR") or "0") == "1"  # default disabled; set to "1" to enable
+
+    if (not DO_CALIBRATE) and INTEGRATED_SENSOR and (not _offsets_file_exists()):
+        try:
+            print("Offsets: local file missing; fetching from GitHub...")
+            r = requests.get(OFFSETS_GH_URL, timeout=15)
+            text = r.text
+        except Exception as e:
+            print("Offsets: GET failed:", e)
+        else:
+            try:
+                gh_offsets = json.loads(text)
+                gh_offsets = {
+                    "temp": float(gh_offsets.get("temp", 0.0)),
+                    "hum":  float(gh_offsets.get("hum", 0.0)),
+                    "press":float(gh_offsets.get("press", 0.0)),
+                }
+                offsets = gh_offsets  # use for this run
+
+                # Persist for next boots
+                try:
+                    with open("/bme_offsets.json", "w") as f:
+                        f.write(json.dumps(gh_offsets))
+                    print("Offsets: saved to /bme_offsets.json")
+                except Exception as e:
+                    print("Offsets: save failed:", e)
+
+                # Re-apply offsets to current-cycle readings
+                t_c = t_raw + offsets["temp"]
+                rh  = rh_raw + offsets["hum"]
+                p_h = p_raw  + offsets["press"]
+                temp_f = t_c * 9/5 + 32
+                dp_c   = dewpoint_c(t_c, rh)
+                dp_f   = dp_c * 9/5 + 32
+                wb_c   = wetbulb_c(t_c, rh)
+                wb_f   = wb_c * 9/5 + 32
+                w      = humidity_ratio(t_c, rh, p_h)
+                h      = enthalpy(t_c, w)
+                # If you want the rest of the script to treat adjusted values as "raw":
+                # temp_c = t_c; pressure_hpa = p_h
+            except Exception as e:
+                print("Offsets: parse/apply failed:", e)
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
     # ---- Remote AIO reference helper ----
     def _get_ref_from_aio_group():
         base = f"https://io.adafruit.com/api/v2/{AIO_USER}"
