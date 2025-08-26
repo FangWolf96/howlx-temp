@@ -4,8 +4,9 @@
 # - Posts to Adafruit IO Group (batch)
 # - Infers charging/discharging/charged and persists last %/V across deep sleep
 # - 2025-08-26 v1.0.1: Exception handling, watchdog, retries
+# -            v1.0.2: add calibration support and read for offset file
 
-import time, math, ssl, struct, supervisor
+import time, math, ssl, struct, supervisor, json
 import board
 import busio
 import wifi, socketpool
@@ -43,6 +44,26 @@ def with_retry(fn, tries=4, base_delay=0.5, label=""):
             delay *= 2
     raise RuntimeError(f"{label} failed after {tries} tries")
 
+# ---- Calibration helpers ----
+def calibrated_flag(off):
+    return 1 if (
+        abs(off.get("temp", 0.0))  > 0.01 or
+        abs(off.get("hum", 0.0))   > 0.01 or
+        abs(off.get("press", 0.0)) > 0.01
+    ) else 0
+
+def load_offsets():
+    # Reads /bme_offsets.json if present; else all zeros
+    try:
+        with open("/bme_offsets.json", "r") as f:
+            d = json.load(f)
+            return {"temp": float(d.get("temp", 0.0)),
+                    "hum":  float(d.get("hum", 0.0)),
+                    "press":float(d.get("press", 0.0))}
+    except Exception:
+        return {"temp": 0.0, "hum": 0.0, "press": 0.0}
+
+
 # ---------- Settings ----------
 SENSOR_NAME = "HowlX Atmos"
 WIFI_SSID = getenv("WIFI_SSID")
@@ -54,6 +75,20 @@ AIO_GROUP = getenv("AIO_GROUP_KEY")
 SLEEP_SECONDS = 300         # 5 minutes
 SEA_LEVEL_HPA = 1013.25     # for better altitude calc
 
+# ---- Calibration config ----
+DO_CALIBRATE = False            # True => print JSON offsets and exit
+CAL_SECONDS  = 60
+
+# Optional: pull reference values from another board's AIO group
+REF_FROM_AIO  = True
+AIO_REF_GROUP = getenv("AIO_REF_GROUP") or "howlx-proto-board-002"
+
+# If REF_FROM_AIO = False, set manual reference values:
+REF_TEMP_C = None
+REF_RH_PCT = None
+REF_P_HPA  = None
+
+
 setup_watchdog(15.0)        # <-- ARM WDT EARLY
 
 # --------------- I2C Setup ---------------
@@ -62,10 +97,10 @@ bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c)
 
 # --------------- Unique ID ---------------
 def _uid_bytes():
-      """
+    """
       Return UID as bytes regardless of how CircuitPython exposes it
       (bytes, list of ints, or string).
-      """
+    """
     uid = microcontroller.cpu.uid
     if isinstance(uid, (bytes, bytearray)):
         return bytes(uid)
@@ -87,6 +122,23 @@ print("Temperature: %.1f °C" % bme280.temperature)
 print("Humidity: %.1f %%" % bme280.humidity)
 print("Pressure: %.1f hPa" % bme280.pressure) 
 
+# --- Proposed calibration offsets /bme_offsets.json (if present) ---
+try:
+    with open("/bme_offsets.json", "r") as f:
+        _raw = f.read()
+    print("Offsets JSON (/bme_offsets.json):", _raw)
+    # (Optional) parse for later use during this boot:
+    _offsets_preview = json.loads(_raw)  # {"temp":..., "hum":..., "press":...}
+except Exception:
+    print("Offsets JSON (/bme_offsets.json): <missing or unreadable>")
+    _offsets_preview = {"temp": 0.0, "hum": 0.0, "press": 0.0}
+
+print("→ Corrected preview: T=%.2f °C | RH=%.2f %% | P=%.2f hPa" % (
+    bme280.temperature + _offsets_preview.get("temp", 0.0),
+    bme280.humidity    + _offsets_preview.get("hum", 0.0),
+    bme280.pressure    + _offsets_preview.get("press", 0.0),
+))
+    
 # ---------- Psychrometric helpers ----------
 def dewpoint_c(temp_c, rh):
     a, b = 17.62, 243.12
@@ -137,17 +189,28 @@ try:
                 float(sensor.altitude))
 
     temp_c, rh, pressure_hpa, alt_m = with_retry(_read_bme_once, label="BME280 read")
+    # ---- Offsets: load & stash raw readings ----
+    t_raw = float(temp_c)
+    rh_raw = float(rh)
+    p_raw  = float(pressure_hpa)
 
-    # Derived metrics
-    temp_f = temp_c * 9 / 5 + 32
-    dp_c = dewpoint_c(temp_c, rh)
-    dp_f = dp_c * 9 / 5 + 32
-    wb_c = wetbulb_c(temp_c, rh)
-    wb_f = wb_c * 9 / 5 + 32
-    w = humidity_ratio(temp_c, rh, pressure_hpa)
-    h = enthalpy(temp_c, w)
+    offsets = load_offsets()   # {"temp": ..., "hum": ..., "press": ...}
+    
+    # ---------- Apply offsets & compute metrics ----------
+    t_c = t_raw + offsets["temp"]
+    rh  = rh_raw + offsets["hum"]
+    p_h = p_raw  + offsets["press"]
 
-    print("==== HowlX Readings ====")
+    temp_f = t_c * 9/5 + 32
+    dp_c   = dewpoint_c(t_c, rh)
+    dp_f   = dp_c * 9/5 + 32
+    wb_c   = wetbulb_c(t_c, rh)
+    wb_f   = wb_c * 9/5 + 32
+    w      = humidity_ratio(t_c, rh, p_h)
+    h      = enthalpy(t_c, w)
+    
+
+    print("==== HowlX Atmos Readings ====")
     print(f"Dry Bulb: {temp_c:.2f} °C / {temp_f:.2f} °F")
     print(f"Dew Point: {dp_c:.2f} °C / {dp_f:.2f} °F")
     print(f"Wet Bulb: {wb_c:.2f} °C / {wb_f:.2f} °F")
@@ -228,7 +291,61 @@ try:
     pool = socketpool.SocketPool(wifi.radio)
     requests = adafruit_requests.Session(pool, ssl.create_default_context())
     print("Wi-Fi OK:", wifi.radio.ipv4_address)
+    
+    # ---- Remote AIO reference helper ----
+    def _get_ref_from_aio_group():
+        base = f"https://io.adafruit.com/api/v2/{AIO_USER}"
+        url  = f"{base}/groups/{AIO_REF_GROUP}"
+        headers = {"X-AIO-Key": AIO_KEY}
+        r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+        r.close()
+        feeds = data.get("feeds", []) or []
+        def last_by_suffix(suf):
+            for f in feeds:
+                k = (f.get("key") or "").lower()
+                if k.endswith(suf):
+                    try: return float(f.get("last_value"))
+                    except: return None
+            return None
+        return (last_by_suffix("temperature-c"),
+                last_by_suffix("humidity-pct"),
+                last_by_suffix("pressure-hpa"))
+    
+    # ---- Calibration mode (print JSON; no file writes) ----
+    if DO_CALIBRATE:
+        print("=== CALIBRATION MODE ===")
+        Ts, Hs, Ps = [], [], []
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < CAL_SECONDS:
+            Ts.append(float(sensor.temperature))
+            Hs.append(float(sensor.relative_humidity))
+            Ps.append(float(sensor.pressure))
+            time.sleep(1.0)
 
+        mean_T = sum(Ts)/len(Ts)
+        mean_H = sum(Hs)/len(Hs)
+        mean_P = sum(Ps)/len(Ps)
+
+        if REF_FROM_AIO:
+            refT, refH, refP = _get_ref_from_aio_group()
+            print("Reference from AIO:", refT, refH, refP)
+            if None in (refT, refH, refP):
+                raise RuntimeError("Ref from AIO missing (temp/hum/press). Check AIO_REF_GROUP & feeds.")
+        else:
+            refT, refH, refP = REF_TEMP_C, REF_RH_PCT, REF_P_HPA
+            if None in (refT, refH, refP):
+                raise RuntimeError("Set REF_* values for manual calibration.")
+
+        new_offsets = {
+            "temp": round(refT - mean_T, 2),
+            "hum":  round(refH - mean_H, 2),
+            "press":round(refP - mean_P, 2),
+        }
+        print(">>> Copy this JSON into /bme_offsets.json on CIRCUITPY:")
+        print(json.dumps(new_offsets))
+        raise SystemExit
+    
     # ---------- Adafruit IO Group batch POST ----------
     BASE = f"https://io.adafruit.com/api/v2/{AIO_USER}"
     URL  = f"{BASE}/groups/{AIO_GROUP}/data"
@@ -257,6 +374,11 @@ try:
             {"key": "battery-v",             "value": round(vbat, 3)},
             {"key": "battery-pct",           "value": round(bpct, 1)},
             {"key": "charging-state",        "value": charging_state},
+            # --- Calibration info ---
+            {"key": "offset-temp",   "value": round(offsets.get("temp", 0.0), 2)},
+            {"key": "offset-hum",    "value": round(offsets.get("hum", 0.0), 2)},
+            {"key": "offset-press",  "value": round(offsets.get("press", 0.0), 2)},
+            {"key": "calibrated",    "value": calibrated_flag(offsets)},  # 1 if any offset != 0
         ]
     }
 
