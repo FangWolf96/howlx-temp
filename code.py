@@ -12,16 +12,49 @@ import adafruit_requests
 from os import getenv
 from adafruit_bme280 import basic as adafruit_bme280
 import adafruit_max1704x
+import microcontroller
 
 # ---------- Settings ----------
+SENSOR_NAME = "HowlX Atmos"
 WIFI_SSID = getenv("WIFI_SSID")
 WIFI_PASSWORD = getenv("WIFI_PASSWORD")
 AIO_USER = getenv("ADAFRUIT_AIO_USERNAME")
 AIO_KEY  = getenv("ADAFRUIT_AIO_KEY")
-AIO_GROUP = getenv("AIO_GROUP_KEY") or "howlx-proto-board-001"
+AIO_GROUP = getenv("AIO_GROUP_KEY") 
 
 SLEEP_SECONDS = 300         # 5 minutes
 SEA_LEVEL_HPA = 1013.25     # for better altitude calc
+
+# --------------- I2C Setup ---------------
+i2c = board.I2C()
+bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c)
+
+# --------------- Unique ID ---------------
+def _uid_bytes():
+    """
+    Return UID as bytes regardless of how CircuitPython exposes it
+    (bytes, list of ints, or string).
+    """
+    uid = microcontroller.cpu.uid
+    if isinstance(uid, (bytes, bytearray)):
+        return bytes(uid)
+    if isinstance(uid, str):
+        # strip common "0x", colons, spaces; interpret as hex
+        s = uid.replace(":", "").replace(" ", "").lower()
+        if s.startswith("0x"):
+            s = s[2:]
+        return bytes.fromhex(s)
+    # iterable of ints/strings
+    return bytes(int(x) for x in uid)
+
+uid_hex = "".join(f"{b:02x}" for b in _uid_bytes())
+sensor_id = uid_hex[-6:]  # last 3 bytes, e.g. "a1b2c3"
+
+# --------------- Print Info --------------
+print(f"{SENSOR_NAME} #{sensor_id} ready")
+print("Temperature: %.1f °C" % bme280.temperature)
+print("Humidity: %.1f %%" % bme280.humidity)
+print("Pressure: %.1f hPa" % bme280.pressure) 
 
 # ---------- Psychrometric helpers ----------
 def dewpoint_c(temp_c, rh):
@@ -46,9 +79,6 @@ def humidity_ratio(temp_c, rh, pressure_hpa=1013.25):
 
 def enthalpy(temp_c, w):
     return 1.006 * temp_c + w * (2501 + 1.805 * temp_c)  # kJ/kg dry air
-
-# ---------- I2C (use singleton to avoid "SCL in use") ----------
-i2c = board.I2C()
 
 # ---------- BME280: read BEFORE Wi-Fi ----------
 sensor = None
@@ -178,6 +208,11 @@ HEADERS = {"X-AIO-Key": AIO_KEY, "Content-Type": "application/json"}
 
 feeds_payload = {
     "feeds": [
+        # --- Identification ---
+        {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
+        {"key": "sensor-id", "value": sensor_id},
+
+        # --- Environment ---
         {"key": "temperature-c",         "value": round(temp_c, 2)},
         {"key": "temperature-f",         "value": round(temp_f, 2)},
         {"key": "dewpoint-c",            "value": round(dp_c, 2)},
@@ -190,7 +225,7 @@ feeds_payload = {
         {"key": "humidity-ratio-kgkg",   "value": round(w, 5)},
         {"key": "enthalpy-kjkg",         "value": round(h, 2)},
 
-        # ---- Battery feeds ----
+        # --- Battery ---
         {"key": "battery-v",             "value": round(vbat, 3)},
         {"key": "battery-pct",           "value": round(bpct, 1)},
         {"key": "charging-state",        "value": charging_state},
