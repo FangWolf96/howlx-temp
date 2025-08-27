@@ -7,6 +7,8 @@
 # -            v1.0.2: add calibration support and read for offset file
 # -            v1.0.3: Offset file fallback fetch (GitHub)
 # - 2025-08-27 v1.0.4: Add Influx DB Support
+# -            v1.0.5: Apply bugfix to correct NameError when no global bme280 defined
+# -             Example - ESP32-S2 with no onboard BME280 
  
 
 
@@ -147,8 +149,6 @@ setup_watchdog(15.0)        # <-- ARM WDT EARLY
 
 # --------------- I2C Setup ---------------
 i2c = board.I2C()
-bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c)
-
 # --------------- Unique ID ---------------
 def _uid_bytes():
     """
@@ -171,28 +171,85 @@ uid_hex = "".join(f"{b:02x}" for b in _uid_bytes())
 sensor_id = uid_hex[-6:]  # last 3 bytes, e.g. "a1b2c3"
 
 # --------------- Print Info --------------
+# --------------- Sensor bring-up (safe) ---------------
+def find_bme280(i2c_obj, tries=8, settle_s=0.25):
+    """
+    Scan for 0x76/0x77 and try to open the sensor.
+    Retries a few times to survive slow power-up on some boards.
+    Returns (sensor, addr_int, seen_list)
+    """
+    addr = None
+    seen = []
+    for attempt in range(1, tries + 1):
+        # scan
+        while not i2c_obj.try_lock():
+            feed_wdt()
+            time.sleep(0.01)
+        try:
+            seen = i2c_obj.scan() or []
+        finally:
+            i2c_obj.unlock()
+
+        # prefer 0x76, else 0x77
+        if 0x76 in seen:
+            addr = 0x76
+        elif 0x77 in seen:
+            addr = 0x77
+        else:
+            print("No BME280 yet; I2C scan:", [hex(a) for a in seen], f"(retry {attempt}/{tries})")
+            time.sleep(settle_s)
+            continue
+
+        # try to open
+        try:
+            s = adafruit_bme280.Adafruit_BME280_I2C(i2c_obj, address=addr)
+            return s, addr, seen
+        except Exception as e:
+            print("BME280 @0x%02X open failed: %s (retry %d/%d)" % (addr, e, attempt, tries))
+            time.sleep(settle_s)
+
+    return None, addr, seen
+
 print(f"{SENSOR_NAME} #{sensor_id} ready")
-print("Temperature: %.1f °C" % bme280.temperature)
-print("Humidity: %.1f %%" % bme280.humidity)
-print("Pressure: %.1f hPa" % bme280.pressure) 
+_sensor_boot, _addr, _seen = find_bme280(i2c)
+
+if _sensor_boot:
+    print("BME280 found at 0x%02X" % _addr)
+    print("Temperature: %.1f °C" % _sensor_boot.temperature)
+    print("Humidity: %.1f %%" % _sensor_boot.humidity)
+    print("Pressure: %.1f hPa" % _sensor_boot.pressure)
+else:
+    print("No BME280 detected on I2C (looked for 0x76/0x77).")
+    print("I2C scan saw:", [("0x%02X" % a) for a in (_seen or [])])
 
 # --- Proposed calibration offsets /bme_offsets.json (if present) ---
 try:
     with open("/bme_offsets.json", "r") as f:
         _raw = f.read()
     print("Offsets JSON (/bme_offsets.json):", _raw)
-    # (Optional) parse for later use during this boot:
     _offsets_preview = json.loads(_raw)  # {"temp":..., "hum":..., "press":...}
 except Exception:
     print("Offsets JSON (/bme_offsets.json): <missing or unreadable>")
     _offsets_preview = {"temp": 0.0, "hum": 0.0, "press": 0.0}
 
-print("→ Corrected preview: T=%.2f °C | RH=%.2f %% | P=%.2f hPa" % (
-    bme280.temperature + _offsets_preview.get("temp", 0.0),
-    bme280.humidity    + _offsets_preview.get("hum", 0.0),
-    bme280.pressure    + _offsets_preview.get("press", 0.0),
-))
-    
+# Use the safely-initialized sensor (_sensor_boot) if present
+if _sensor_boot:
+    try:
+        t_off = float(_offsets_preview.get("temp", 0.0))
+        h_off = float(_offsets_preview.get("hum", 0.0))
+        p_off = float(_offsets_preview.get("press", 0.0))
+    except Exception:
+        t_off = h_off = p_off = 0.0
+
+    print("→ Corrected preview: T=%.2f °C | RH=%.2f %% | P=%.2f hPa" % (
+        _sensor_boot.temperature + t_off,
+        _sensor_boot.humidity    + h_off,
+        _sensor_boot.pressure    + p_off,
+    ))
+else:
+    print("→ Corrected preview: (no sensor detected yet)")
+
+   
 # ---------- Psychrometric helpers ----------
 def dewpoint_c(temp_c, rh):
     a, b = 17.62, 243.12
