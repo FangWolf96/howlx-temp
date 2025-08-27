@@ -6,6 +6,9 @@
 # - 2025-08-26 v1.0.1: Exception handling, watchdog, retries
 # -            v1.0.2: add calibration support and read for offset file
 # -            v1.0.3: Offset file fallback fetch (GitHub)
+# - 2025-08-27 v1.0.4: Add Influx DB Support
+ 
+
 
 import time, math, ssl, struct, supervisor, json
 import board
@@ -45,6 +48,40 @@ def with_retry(fn, tries=4, base_delay=0.5, label=""):
             delay *= 2
     raise RuntimeError(f"{label} failed after {tries} tries")
 
+# ---- Influx line protocol helpers ----
+def _lp_escape_tag(v):
+    # escape commas, spaces, equals in tag values
+    return str(v).replace(",", r"\,").replace(" ", r"\ ").replace("=", r"\=")
+
+def _lp_qstr(v):
+    # quote string field values for line protocol
+    return '"' + str(v).replace('"', r'\"') + '"'
+    
+# ---- Env helpers (robust across str/int/bool) ----
+def env_flag(name, default=False):
+    v = getenv(name)
+    if v is None or v == "":
+        return bool(default)
+    if isinstance(v, (bool, int)):
+        return bool(v)
+    try:
+        s = v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+    except Exception:
+        s = str(v)
+    s = s.strip().strip('"').strip("'").lower()
+    return s in ("1", "true", "yes", "on", "y")
+
+def env_int(name, default=0):
+    v = getenv(name)
+    if v is None or v == "":
+        return default
+    if isinstance(v, int):
+        return v
+    try:
+        return int(str(v).strip().strip('"').strip("'"))
+    except Exception:
+        return default
+
 # ---- Calibration helpers ----
 def calibrated_flag(off):
     return 1 if (
@@ -73,6 +110,22 @@ AIO_USER = getenv("ADAFRUIT_AIO_USERNAME")
 AIO_KEY  = getenv("ADAFRUIT_AIO_KEY")
 AIO_GROUP = getenv("AIO_GROUP_KEY")
 
+# ---- Feature flags ----
+AIO_ENABLE     = env_flag("AIO_ENABLE",  True)   # default ON
+INFLUX_ENABLE  = env_flag("INFLUX_ENABLE", False)  # default OFF
+
+# ---- InfluxDB (v2) config ----
+INFLUX_URL    = getenv("INFLUX_URL")    or "https://influx.wolfco.io"
+INFLUX_ORG    = getenv("INFLUX_ORG")    or ""   # e.g., "wolfco"
+INFLUX_BUCKET = getenv("INFLUX_BUCKET") or ""   # e.g., "howlx-atmos"
+INFLUX_TOKEN  = getenv("INFLUX_TOKEN")  or ""   # Influx API token
+
+# (optional) Influx v1 compat (leave blank to skip)
+INFLUX_V1_DB   = getenv("INFLUX_V1_DB")   or ""
+INFLUX_V1_USER = getenv("INFLUX_V1_USER") or ""
+INFLUX_V1_PASS = getenv("INFLUX_V1_PASS") or ""
+
+# Operational Variables
 SLEEP_SECONDS = 300         # 5 minutes
 SEA_LEVEL_HPA = 1013.25     # for better altitude calc
 
@@ -293,6 +346,72 @@ try:
     requests = adafruit_requests.Session(pool, ssl.create_default_context())
     print("Wi-Fi OK:", wifi.radio.ipv4_address)
     
+    # ---- InfluxDB write (v2 or v1) ----
+    def post_to_influx():
+        if not INFLUX_ENABLE:
+            return 204  # disabled -> pretend OK
+
+        # measurement + tags
+        meas = "howlx"
+        tags = "device=%s,name=%s" % (_lp_escape_tag(sensor_id), _lp_escape_tag(SENSOR_NAME))
+
+        # fields (use adjusted values you already computed)
+        fields = []
+        fields.append("temperature_c=%.2f" % (t_c,))
+        fields.append("temperature_f=%.2f" % (temp_f,))
+        fields.append("dewpoint_c=%.2f" % (dp_c,))
+        fields.append("dewpoint_f=%.2f" % (dp_f,))
+        fields.append("wetbulb_c=%.2f" % (wb_c,))
+        fields.append("wetbulb_f=%.2f" % (wb_f,))
+        fields.append("humidity_pct=%.2f" % (rh,))
+        fields.append("pressure_hpa=%.2f" % (p_h,))
+        fields.append("altitude_m=%.2f" % (alt_m,))
+        fields.append("humidity_ratio_kgkg=%.5f" % (w,))
+        fields.append("enthalpy_kjkg=%.2f" % (h,))
+        fields.append("battery_v=%.3f" % (vbat,))
+        fields.append("battery_pct=%.1f" % (bpct,))
+        fields.append('charging_state=%s' % _lp_qstr(charging_state))
+        fields.append("offset_temp=%.2f" % (offsets.get("temp", 0.0),))
+        fields.append("offset_hum=%.2f" % (offsets.get("hum", 0.0),))
+        fields.append("offset_press=%.2f" % (offsets.get("press", 0.0),))
+        fields.append("calibrated=%di" % (1 if calibrated_flag(offsets) else 0))
+
+        line = "%s,%s %s" % (meas, tags, ",".join(fields))
+        # no timestamp -> server receive time
+
+        # Prefer v2
+        if INFLUX_TOKEN and INFLUX_ORG and INFLUX_BUCKET:
+            url = "%s/api/v2/write?org=%s&bucket=%s&precision=s" % (INFLUX_URL, INFLUX_ORG, INFLUX_BUCKET)
+            headers = {
+                "Authorization": "Token %s" % INFLUX_TOKEN,
+                "Content-Type": "text/plain; charset=utf-8",
+                "Accept": "application/json",
+            }
+            r = requests.post(url, data=line + "\n", headers=headers, timeout=15)
+            sc = r.status_code
+            r.close()
+            if sc >= 400:
+                raise RuntimeError("Influx v2 HTTP %d" % sc)
+            print("Influx v2 write status:", sc)
+            return sc
+
+        # Fallback v1
+        if INFLUX_V1_DB:
+            auth_q = ""
+            if INFLUX_V1_USER and INFLUX_V1_PASS:
+                auth_q = "&u=%s&p=%s" % (INFLUX_V1_USER, INFLUX_V1_PASS)
+            url = "%s/write?db=%s&precision=s%s" % (INFLUX_URL, INFLUX_V1_DB, auth_q)
+            r = requests.post(url, data=line + "\n", headers={"Content-Type": "text/plain"}, timeout=15)
+            sc = r.status_code
+            r.close()
+            if sc >= 400:
+                raise RuntimeError("Influx v1 HTTP %d" % sc)
+            print("Influx v1 write status:", sc)
+            return sc
+
+        print("Influx not configured (missing org/bucket/token or v1 db)")
+        return 204
+    
     # ---- Offset file fallback fetch (GitHub) ----
     OFFSETS_GH_URL = "https://raw.githubusercontent.com/FangWolf96/howlx-temp/refs/heads/main/bme_offsets.json"
 
@@ -407,51 +526,65 @@ try:
         raise SystemExit
     
     # ---------- Adafruit IO Group batch POST ----------
-    BASE = f"https://io.adafruit.com/api/v2/{AIO_USER}"
-    URL  = f"{BASE}/groups/{AIO_GROUP}/data"
-    HEADERS = {"X-AIO-Key": AIO_KEY, "Content-Type": "application/json"}
+    if AIO_ENABLE:
+        BASE = f"https://io.adafruit.com/api/v2/{AIO_USER}"
+        URL  = f"{BASE}/groups/{AIO_GROUP}/data"
+        HEADERS = {"X-AIO-Key": AIO_KEY, "Content-Type": "application/json"}
 
-    feeds_payload = {
-        "feeds": [
-            # --- Identification ---
-            {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
-            {"key": "sensor-id", "value": sensor_id},   # <-- OPTIONAL: remove if you want name-only
+        feeds_payload = {
+            "feeds": [
+                # --- Identification ---
+                {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
+                {"key": "sensor-id",   "value": sensor_id},
 
-            # --- Environment ---
-            {"key": "temperature-c",         "value": round(temp_c, 2)},
-            {"key": "temperature-f",         "value": round(temp_f, 2)},
-            {"key": "dewpoint-c",            "value": round(dp_c, 2)},
-            {"key": "dewpoint-f",            "value": round(dp_f, 2)},
-            {"key": "wetbulb-c",             "value": round(wb_c, 2)},
-            {"key": "wetbulb-f",             "value": round(wb_f, 2)},
-            {"key": "humidity-pct",          "value": round(rh, 2)},
-            {"key": "pressure-hpa",          "value": round(pressure_hpa, 2)},
-            {"key": "altitude-m",            "value": round(alt_m, 2)},
-            {"key": "humidity-ratio-kgkg",   "value": round(w, 5)},
-            {"key": "enthalpy-kjkg",         "value": round(h, 2)},
+                # --- Environment (corrected) ---
+                {"key": "temperature-c",         "value": round(t_c, 2)},
+                {"key": "temperature-f",         "value": round(temp_f, 2)},
+                {"key": "dewpoint-c",            "value": round(dp_c, 2)},
+                {"key": "dewpoint-f",            "value": round(dp_f, 2)},
+                {"key": "wetbulb-c",             "value": round(wb_c, 2)},
+                {"key": "wetbulb-f",             "value": round(wb_f, 2)},
+                {"key": "humidity-pct",          "value": round(rh, 2)},
+                {"key": "pressure-hpa",          "value": round(p_h, 2)},
+                {"key": "altitude-m",            "value": round(alt_m, 2)},
+                {"key": "humidity-ratio-kgkg",   "value": round(w, 5)},
+                {"key": "enthalpy-kjkg",         "value": round(h, 2)},
 
-            # --- Battery ---
-            {"key": "battery-v",             "value": round(vbat, 3)},
-            {"key": "battery-pct",           "value": round(bpct, 1)},
-            {"key": "charging-state",        "value": charging_state},
-            # --- Calibration info ---
-            {"key": "offset-temp",   "value": round(offsets.get("temp", 0.0), 2)},
-            {"key": "offset-hum",    "value": round(offsets.get("hum", 0.0), 2)},
-            {"key": "offset-press",  "value": round(offsets.get("press", 0.0), 2)},
-            {"key": "calibrated",    "value": calibrated_flag(offsets)},  # 1 if any offset != 0
-        ]
-    }
+                # --- Battery ---
+                {"key": "battery-v",             "value": round(vbat, 3)},
+                {"key": "battery-pct",           "value": round(bpct, 1)},
+                {"key": "charging-state",        "value": charging_state},
 
-    def _post_payload():
-        r = requests.post(URL, json=feeds_payload, headers=HEADERS, timeout=15)
-        sc = r.status_code
-        r.close()
-        if sc >= 400:
-            raise RuntimeError(f"HTTP {sc}")
-        print("AIO group POST status:", sc)
-        return sc
+                # --- Calibration info ---
+                {"key": "offset-temp",  "value": round(offsets.get("temp", 0.0), 2)},
+                {"key": "offset-hum",   "value": round(offsets.get("hum", 0.0), 2)},
+                {"key": "offset-press", "value": round(offsets.get("press", 0.0), 2)},
+                {"key": "calibrated",   "value": calibrated_flag(offsets)},
+            ]
+        }
 
-    with_retry(_post_payload, label="Adafruit IO POST")
+        def _post_payload():
+            r = requests.post(URL, json=feeds_payload, headers=HEADERS, timeout=15)
+            sc = r.status_code
+            r.close()
+            if sc >= 400:
+                raise RuntimeError(f"HTTP {sc}")
+            print("AIO group POST status:", sc)
+            return sc
+
+        with_retry(_post_payload, label="Adafruit IO POST")
+    else:
+        print("AIO disabled by settings.")
+        
+    # --- InfluxDB write (guarded) ---
+    if INFLUX_ENABLE:
+        try:
+            with_retry(post_to_influx, label="Influx write")
+        except Exception as e:
+            print("Influx write failed:", e)
+    else:
+        print("Influx disabled by settings.")
+
 
     # ---------- Persist latest battery values for next wake ----------
     try:
