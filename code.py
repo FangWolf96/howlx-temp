@@ -9,7 +9,8 @@
 # - 2025-08-27 v1.0.4: Add Influx DB Support
 # -            v1.0.5: Apply bugfix to correct NameError when no global bme280 defined
 # -             Example - ESP32-S2 with no onboard BME280 
- 
+# - 2025-10-20 v1.0.6: Add BME680 + SHT3X support, board detection, fw-version tagging, and improved telemetry identification
+
 
 
 import time, math, ssl, struct, supervisor, json
@@ -19,6 +20,8 @@ import wifi, socketpool
 import adafruit_requests
 from os import getenv
 from adafruit_bme280 import basic as adafruit_bme280
+import adafruit_bme680
+import adafruit_sht31d
 import adafruit_max1704x
 import microcontroller, watchdog   # UID + hardware watchdog
 
@@ -171,12 +174,12 @@ uid_hex = "".join(f"{b:02x}" for b in _uid_bytes())
 sensor_id = uid_hex[-6:]  # last 3 bytes, e.g. "a1b2c3"
 
 # --------------- Print Info --------------
-# --------------- Sensor bring-up (safe) ---------------
-def find_bme280(i2c_obj, tries=8, settle_s=0.25):
+# --------------- Sensor bring-up (safe, supports BME280/BME680/SHT3x) ---------------
+def find_env_sensor(i2c_obj, tries=8, settle_s=0.25):
     """
-    Scan for 0x76/0x77 and try to open the sensor.
-    Retries a few times to survive slow power-up on some boards.
-    Returns (sensor, addr_int, seen_list)
+    Probe for BME680 (0x76/0x77), then BME280 (0x76/0x77), then SHT3x (0x44/0x45)
+    Returns (sensor_type, sensor_obj, addr_int, seen_list)
+    sensor_type in {"BME680","BME280","SHT3x",None}
     """
     addr = None
     seen = []
@@ -190,37 +193,79 @@ def find_bme280(i2c_obj, tries=8, settle_s=0.25):
         finally:
             i2c_obj.unlock()
 
-        # prefer 0x76, else 0x77
-        if 0x76 in seen:
-            addr = 0x76
-        elif 0x77 in seen:
-            addr = 0x77
-        else:
-            print("No BME280 yet; I2C scan:", [hex(a) for a in seen], f"(retry {attempt}/{tries})")
-            time.sleep(settle_s)
-            continue
+        # --- Try BME680 ---
+        for a in (0x76, 0x77):
+            if a in seen:
+                try:
+                    s = adafruit_bme680.Adafruit_BME680_I2C(i2c_obj, address=a)
+                    return "BME680", s, a, seen
+                except Exception:
+                    pass
 
-        # try to open
-        try:
-            s = adafruit_bme280.Adafruit_BME280_I2C(i2c_obj, address=addr)
-            return s, addr, seen
-        except Exception as e:
-            print("BME280 @0x%02X open failed: %s (retry %d/%d)" % (addr, e, attempt, tries))
-            time.sleep(settle_s)
+        # --- Try BME280 ---
+        for a in (0x76, 0x77):
+            if a in seen:
+                try:
+                    s = adafruit_bme280.Adafruit_BME280_I2C(i2c_obj, address=a)
+                    return "BME280", s, a, seen
+                except Exception:
+                    pass
 
-    return None, addr, seen
+        # --- Try SHT3x ---
+        for a in (0x44, 0x45):
+            if a in seen:
+                try:
+                    s = adafruit_sht31d.SHT31D(i2c_obj, address=a)
+                    return "SHT3x", s, a, seen
+                except Exception:
+                    pass
 
-print(f"{SENSOR_NAME} #{sensor_id} ready")
-_sensor_boot, _addr, _seen = find_bme280(i2c)
+        print("No supported env sensor yet; I2C scan:", [hex(a) for a in seen], f"(retry {attempt}/{tries})")
+        time.sleep(settle_s)
+
+    return None, None, addr, seen
+# --------------- Detect board model (S2/S3/RP etc.) ---------------
+import sys, os
+def detect_board_code():
+    p = getattr(sys, "platform", "").lower()
+    if "esp32s2" in p: return "S2"
+    if "esp32s3" in p: return "S3"
+    if "rp2040" in p or p == "rp2": return "RP"
+    # fallback: uname
+    try:
+        mach = os.uname().machine.lower()
+        if "esp32s2" in mach: return "S2"
+        if "esp32s3" in mach: return "S3"
+        if "rp2040" in mach: return "RP"
+    except Exception:
+        pass
+    return "UNK"
+
+board_code = detect_board_code()
+
+sensor_type, _sensor_boot, _addr, _seen = find_env_sensor(i2c)
+
+print(f"{SENSOR_NAME} [{sensor_type}:{board_code}-{sensor_id}] ready")
+
 
 if _sensor_boot:
-    print("BME280 found at 0x%02X" % _addr)
-    print("Temperature: %.1f °C" % _sensor_boot.temperature)
-    print("Humidity: %.1f %%" % _sensor_boot.humidity)
-    print("Pressure: %.1f hPa" % _sensor_boot.pressure)
+    print(f"{sensor_type} found at 0x{_addr:02X}")
+    if sensor_type == "BME680":
+        print("Temperature: %.1f °C" % _sensor_boot.temperature)
+        print("Humidity: %.1f %%" % _sensor_boot.humidity)
+        print("Pressure: %.1f hPa" % _sensor_boot.pressure)
+        print("Gas: %.0f Ω" % _sensor_boot.gas)
+    elif sensor_type == "BME280":
+        print("Temperature: %.1f °C" % _sensor_boot.temperature)
+        print("Humidity: %.1f %%" % _sensor_boot.humidity)
+        print("Pressure: %.1f hPa" % _sensor_boot.pressure)
+    else:  # SHT3x
+        print("Temperature: %.1f °C" % _sensor_boot.temperature)
+        print("Humidity: %.1f %%" % _sensor_boot.relative_humidity)
 else:
-    print("No BME280 detected on I2C (looked for 0x76/0x77).")
+    print("No supported sensor detected (BME680/BME280 @0x76/0x77 or SHT3x @0x44/0x45).")
     print("I2C scan saw:", [("0x%02X" % a) for a in (_seen or [])])
+
 
 # --- Proposed calibration offsets /bme_offsets.json (if present) ---
 try:
@@ -241,11 +286,15 @@ if _sensor_boot:
     except Exception:
         t_off = h_off = p_off = 0.0
 
-    print("→ Corrected preview: T=%.2f °C | RH=%.2f %% | P=%.2f hPa" % (
-        _sensor_boot.temperature + t_off,
-        _sensor_boot.humidity    + h_off,
-        _sensor_boot.pressure    + p_off,
-    ))
+    if sensor_type == "SHT3x":
+        temp_preview = (_sensor_boot.temperature + t_off)
+        hum_preview  = (_sensor_boot.relative_humidity + h_off)
+        print("→ Corrected preview: T=%.2f °C | RH=%.2f %% | P=n/a" % (temp_preview, hum_preview))
+    else:
+        temp_preview = (_sensor_boot.temperature + t_off)
+        hum_preview  = (_sensor_boot.humidity + h_off)
+        press_preview = (_sensor_boot.pressure + p_off)
+        print("→ Corrected preview: T=%.2f °C | RH=%.2f %% | P=%.2f hPa" % (temp_preview, hum_preview, press_preview))
 else:
     print("→ Corrected preview: (no sensor detected yet)")
 
@@ -275,59 +324,88 @@ def enthalpy(temp_c, w):
     return 1.006 * temp_c + w * (2501 + 1.805 * temp_c)  # kJ/kg dry air
 
 try:
-    # ---------- BME280: read BEFORE Wi-Fi ----------
-    sensor = None
-    while sensor is None:
-        while not i2c.try_lock():
-            feed_wdt()
-        addrs = [hex(x) for x in i2c.scan()]
-        i2c.unlock()
-        if "0x76" in addrs:
-            sensor = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
-        elif "0x77" in addrs:
-            sensor = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x77)
-        else:
-            print("No BME280 found; I2C:", addrs, "retrying in 2s…")
-            time.sleep(2)
-            feed_wdt()
+    # ---------- Unified read (before Wi-Fi) ----------
+    if not _sensor_boot:
+        # keep trying until found (like your original)
+        while not _sensor_boot:
+            sensor_type, _sensor_boot, _addr, _seen = find_env_sensor(i2c, tries=1)
+            if not _sensor_boot:
+                print("No env sensor found; I2C:", [hex(x) for x in (_seen or [])], "retrying in 2s…")
+                time.sleep(2)
+                feed_wdt()
 
-    sensor.sea_level_pressure = SEA_LEVEL_HPA
+    # Configure per-sensor (e.g., sea level for pressure sensors)
+    if sensor_type in ("BME280", "BME680"):
+        try:
+            _sensor_boot.sea_level_pressure = SEA_LEVEL_HPA
+        except Exception:
+            pass
 
-    def _read_bme_once():
-        return (float(sensor.temperature),
-                float(sensor.relative_humidity),
-                float(sensor.pressure),
-                float(sensor.altitude))
+    def _read_env_once():
+        if sensor_type == "BME680":
+            return (
+                float(_sensor_boot.temperature),
+                float(_sensor_boot.humidity),
+                float(_sensor_boot.pressure),
+                float(getattr(_sensor_boot, "altitude", 0.0)),  # some builds expose altitude
+                float(_sensor_boot.gas),
+            )
+        elif sensor_type == "BME280":
+            return (
+                float(_sensor_boot.temperature),
+                float(_sensor_boot.humidity),
+                float(_sensor_boot.pressure),
+                float(_sensor_boot.altitude),
+                None,  # no gas
+            )
+        else:  # SHT3x
+            return (
+                float(_sensor_boot.temperature),
+                float(_sensor_boot.relative_humidity),
+                None,   # no pressure
+                None,   # no altitude
+                None,   # no gas
+            )
 
-    temp_c, rh, pressure_hpa, alt_m = with_retry(_read_bme_once, label="BME280 read")
+    temp_c, rh, pressure_hpa, alt_m, gas_ohms = with_retry(_read_env_once, label=f"{sensor_type} read")
+
     # ---- Offsets: load & stash raw readings ----
     t_raw = float(temp_c)
     rh_raw = float(rh)
-    p_raw  = float(pressure_hpa)
+    p_raw  = None if pressure_hpa is None else float(pressure_hpa)
 
     offsets = load_offsets()   # {"temp": ..., "hum": ..., "press": ...}
-    
+
     # ---------- Apply offsets & compute metrics ----------
-    t_c = t_raw + offsets["temp"]
-    rh  = rh_raw + offsets["hum"]
-    p_h = p_raw  + offsets["press"]
+    t_c = t_raw + offsets.get("temp", 0.0)
+    rh  = rh_raw + offsets.get("hum", 0.0)
+    p_h = None if p_raw is None else (p_raw + offsets.get("press", 0.0))
+
+    # Psychrometrics: if no pressure, use sea-level for derived calcs only
+    p_for_calc = p_h if p_h is not None else SEA_LEVEL_HPA
 
     temp_f = t_c * 9/5 + 32
     dp_c   = dewpoint_c(t_c, rh)
     dp_f   = dp_c * 9/5 + 32
     wb_c   = wetbulb_c(t_c, rh)
     wb_f   = wb_c * 9/5 + 32
-    w      = humidity_ratio(t_c, rh, p_h)
+    w      = humidity_ratio(t_c, rh, p_for_calc)
     h      = enthalpy(t_c, w)
-    
 
     print("==== HowlX Atmos Readings ====")
-    print(f"Dry Bulb: {temp_c:.2f} °C / {temp_f:.2f} °F")
+    print(f"Sensor: {sensor_type} @ 0x{_addr:02X}")
+    print(f"Dry Bulb: {t_c:.2f} °C / {temp_f:.2f} °F")
     print(f"Dew Point: {dp_c:.2f} °C / {dp_f:.2f} °F")
     print(f"Wet Bulb: {wb_c:.2f} °C / {wb_f:.2f} °F")
     print(f"Humidity: {rh:.2f} %")
-    print(f"Pressure: {pressure_hpa:.2f} hPa")
-    print(f"Altitude: {alt_m:.2f} m")
+    if p_h is not None:
+        print(f"Pressure: {p_h:.2f} hPa")
+        if alt_m is not None:
+            print(f"Altitude: {alt_m:.2f} m")
+    else:
+        print("Pressure: n/a (no pressure sensor)")
+    if gas_ohms is not None:
+        print(f"Gas: {gas_ohms:.0f} Ω")
     print(f"Humidity Ratio: {w:.5f} kg/kg")
     print(f"Enthalpy: {h:.2f} kJ/kg")
     print("========================")
@@ -421,16 +499,24 @@ try:
         fields.append("wetbulb_c=%.2f" % (wb_c,))
         fields.append("wetbulb_f=%.2f" % (wb_f,))
         fields.append("humidity_pct=%.2f" % (rh,))
-        fields.append("pressure_hpa=%.2f" % (p_h,))
-        fields.append("altitude_m=%.2f" % (alt_m,))
         fields.append("humidity_ratio_kgkg=%.5f" % (w,))
         fields.append("enthalpy_kjkg=%.2f" % (h,))
+
+        # only include these if they exist for the current sensor
+        if p_h is not None:
+            fields.append("pressure_hpa=%.2f" % (p_h,))
+            if alt_m is not None:
+                fields.append("altitude_m=%.2f" % (alt_m,))
+        if gas_ohms is not None:
+            fields.append("gas_ohms=%di" % int(gas_ohms))
+
         fields.append("battery_v=%.3f" % (vbat,))
         fields.append("battery_pct=%.1f" % (bpct,))
         fields.append('charging_state=%s' % _lp_qstr(charging_state))
         fields.append("offset_temp=%.2f" % (offsets.get("temp", 0.0),))
         fields.append("offset_hum=%.2f" % (offsets.get("hum", 0.0),))
-        fields.append("offset_press=%.2f" % (offsets.get("press", 0.0),))
+        if p_raw is not None:
+            fields.append("offset_press=%.2f" % (offsets.get("press", 0.0),))
         fields.append("calibrated=%di" % (1 if calibrated_flag(offsets) else 0))
 
         line = "%s,%s %s" % (meas, tags, ",".join(fields))
@@ -582,43 +668,58 @@ try:
         print(json.dumps(new_offsets))
         raise SystemExit
     
-    # ---------- Adafruit IO Group batch POST ----------
+ # ---------- Adafruit IO Group batch POST ----------
     if AIO_ENABLE:
         BASE = f"https://io.adafruit.com/api/v2/{AIO_USER}"
         URL  = f"{BASE}/groups/{AIO_GROUP}/data"
         HEADERS = {"X-AIO-Key": AIO_KEY, "Content-Type": "application/json"}
 
-        feeds_payload = {
-            "feeds": [
-                # --- Identification ---
-                {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
-                {"key": "sensor-id",   "value": sensor_id},
+        # BEGIN REPLACE: build feeds conditionally per sensor
+        feeds = [
+            # --- Identification ---
+            {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
+            {"key": "sensor-id",   "value": sensor_id},
+            {"key": "sensor-type", "value": sensor_type},
+            {"key": "fw-version",  "value": "1.0.6"},
 
-                # --- Environment (corrected) ---
-                {"key": "temperature-c",         "value": round(t_c, 2)},
-                {"key": "temperature-f",         "value": round(temp_f, 2)},
-                {"key": "dewpoint-c",            "value": round(dp_c, 2)},
-                {"key": "dewpoint-f",            "value": round(dp_f, 2)},
-                {"key": "wetbulb-c",             "value": round(wb_c, 2)},
-                {"key": "wetbulb-f",             "value": round(wb_f, 2)},
-                {"key": "humidity-pct",          "value": round(rh, 2)},
-                {"key": "pressure-hpa",          "value": round(p_h, 2)},
-                {"key": "altitude-m",            "value": round(alt_m, 2)},
-                {"key": "humidity-ratio-kgkg",   "value": round(w, 5)},
-                {"key": "enthalpy-kjkg",         "value": round(h, 2)},
+            # --- Environment (corrected) ---
+            {"key": "temperature-c",         "value": round(t_c, 2)},
+            {"key": "temperature-f",         "value": round(temp_f, 2)},
+            {"key": "dewpoint-c",            "value": round(dp_c, 2)},
+            {"key": "dewpoint-f",            "value": round(dp_f, 2)},
+            {"key": "wetbulb-c",             "value": round(wb_c, 2)},
+            {"key": "wetbulb-f",             "value": round(wb_f, 2)},
+            {"key": "humidity-pct",          "value": round(rh, 2)},
+            {"key": "humidity-ratio-kgkg",   "value": round(w, 5)},
+            {"key": "enthalpy-kjkg",         "value": round(h, 2)},
+        ]
 
-                # --- Battery ---
-                {"key": "battery-v",             "value": round(vbat, 3)},
-                {"key": "battery-pct",           "value": round(bpct, 1)},
-                {"key": "charging-state",        "value": charging_state},
+        if p_h is not None:
+            feeds.append({"key": "pressure-hpa", "value": round(p_h, 2)})
+            if alt_m is not None:
+                feeds.append({"key": "altitude-m", "value": round(alt_m, 2)})
 
-                # --- Calibration info ---
-                {"key": "offset-temp",  "value": round(offsets.get("temp", 0.0), 2)},
-                {"key": "offset-hum",   "value": round(offsets.get("hum", 0.0), 2)},
-                {"key": "offset-press", "value": round(offsets.get("press", 0.0), 2)},
-                {"key": "calibrated",   "value": calibrated_flag(offsets)},
-            ]
-        }
+        if gas_ohms is not None:
+            feeds.append({"key": "gas-ohms", "value": int(gas_ohms)})
+
+        # --- Battery ---
+        feeds += [
+            {"key": "battery-v",             "value": round(vbat, 3)},
+            {"key": "battery-pct",           "value": round(bpct, 1)},
+            {"key": "charging-state",        "value": charging_state},
+        ]
+
+        # --- Calibration info ---
+        feeds += [
+            {"key": "offset-temp",  "value": round(offsets.get("temp", 0.0), 2)},
+            {"key": "offset-hum",   "value": round(offsets.get("hum", 0.0), 2)},
+        ]
+        if p_raw is not None:
+            feeds.append({"key": "offset-press", "value": round(offsets.get("press", 0.0), 2)})
+        feeds.append({"key": "calibrated", "value": calibrated_flag(offsets)})
+
+        feeds_payload = {"feeds": feeds}
+        # END REPLACE
 
         def _post_payload():
             r = requests.post(URL, json=feeds_payload, headers=HEADERS, timeout=15)
@@ -628,7 +729,7 @@ try:
                 raise RuntimeError(f"HTTP {sc}")
             print("AIO group POST status:", sc)
             return sc
-
+            
         with_retry(_post_payload, label="Adafruit IO POST")
     else:
         print("AIO disabled by settings.")
