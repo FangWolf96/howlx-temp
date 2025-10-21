@@ -1,16 +1,16 @@
-# Howlx Atmos Sensor v1.0.1 — HowlX proto board (Feather ESP32-S2 + BME280 + MAX17048)
-# - Reads BME280 (0x76/0x77)
+# HowlX Atmos Sensor v1.0.7 — HowlX proto board (Feather ESP32-S2 + BME280/SHT3x + MAX17048)
+# - Reads BME280/SHT3x environmental sensors (0x76/0x77/0x44)
 # - Reads MAX17048 fuel gauge (0x36)
 # - Posts to Adafruit IO Group (batch)
 # - Infers charging/discharging/charged and persists last %/V across deep sleep
 # - 2025-08-26 v1.0.1: Exception handling, watchdog, retries
-# -            v1.0.2: add calibration support and read for offset file
+# -            v1.0.2: Add calibration support and read for offset file
 # -            v1.0.3: Offset file fallback fetch (GitHub)
 # - 2025-08-27 v1.0.4: Add Influx DB Support
 # -            v1.0.5: Apply bugfix to correct NameError when no global bme280 defined
-# -             Example - ESP32-S2 with no onboard BME280 
-# - 2025-10-20 v1.0.6: Add BME680 + SHT3X support, board detection, fw-version tagging, and improved telemetry identification
-
+# -             Example – ESP32-S2 with no onboard BME280
+# - 2025-10-20 v1.0.6: Add BME680 + SHT3x support, board detection, fw-version tagging, and improved telemetry identification
+# - 2025-10-21 v1.0.7: Improved MAX17048 handling (dual-sample average, dual-API quick_start, USB detection, and charge inference)
 
 
 import time, math, ssl, struct, supervisor, json
@@ -414,6 +414,7 @@ try:
     fg = adafruit_max1704x.MAX17048(i2c)
 
     def usb_present():
+        """Detect if USB power is present."""
         try:
             return bool(supervisor.runtime.usb_connected)
         except Exception:
@@ -436,12 +437,36 @@ try:
             pass
         return None
 
+    # First read (average two samples)
     time.sleep(0.1); v1, p1 = fg.cell_voltage, fg.cell_percent
     time.sleep(0.1); v2, p2 = fg.cell_voltage, fg.cell_percent
     vbat = (v1 + v2) / 2.0
     bpct = (p1 + p2) / 2.0
-    usb = usb_present()
+    usb  = usb_present()
 
+    # Kick the gauge if SOC looks wrong, then clamp
+    if bpct > 101.5 or bpct < -0.5:
+        try:
+            # Support both library styles: method or property
+            if callable(getattr(fg, "quick_start", None)):
+                fg.quick_start()        # method
+            else:
+                fg.quick_start = True   # property
+
+            time.sleep(0.25)
+            # re-read after quick_start
+            v1, p1 = fg.cell_voltage, fg.cell_percent
+            time.sleep(0.1)
+            v2, p2 = fg.cell_voltage, fg.cell_percent
+            vbat = (v1 + v2) / 2.0
+            bpct = (p1 + p2) / 2.0
+            print("MAX17048 quick_start applied")
+        except Exception as e:
+            print("MAX17048 quick_start failed:", e)
+
+    bpct = max(0.0, min(100.0, bpct))  # clamp to 0..100
+
+    # Load previous values from deep sleep to infer trend
     prev_pct = prev_v = None
     try:
         import alarm
@@ -452,23 +477,37 @@ try:
         pass
 
     def infer_state(usb_present_flag, v_now, p_now, p_prev=None, v_prev=None):
+        near_full_v = 4.18
+        near_full_p = 99.0
+        rising_pct = (p_prev is not None) and ((p_now - p_prev) > 0.10)   # >0.10 %
+        rising_v   = (v_prev is not None) and ((v_now - v_prev) > 0.008)  # >8 mV
+
         if usb_present_flag is True:
-            if v_now >= 4.18 or p_now >= 99.0:
+            if (v_now >= near_full_v) or (p_now >= near_full_p):
                 return "charged"
-            if (p_prev is not None and (p_now - p_prev) > 0.05) or \
-               (v_prev is not None and (v_now - v_prev) > 0.01):
+            if rising_pct or rising_v:
                 return "charging"
-            return "usb-present"
-        elif usb_present_flag is False:
+            return "plugged"  # on USB but not clearly charging/discharging
+
+        if usb_present_flag is False:
             return "discharging"
-        else:
-            if (p_prev is not None and (p_now - p_prev) > 0.05) or \
-               (v_prev is not None and (v_now - v_prev) > 0.01):
-                return "charging"
-            return "discharging"
+
+        # USB unknown
+        if (v_now >= near_full_v) or (p_now >= near_full_p):
+            return "charged"
+        if rising_pct or rising_v:
+            return "charging"
+        return "discharging"
 
     charging_state = infer_state(usb, vbat, bpct, prev_pct, prev_v)
     print(f"Battery: {vbat:.3f} V | {bpct:.1f}% | state={charging_state}")
+
+    # Persist latest values for next wake
+    try:
+        import alarm
+        alarm.sleep_memory[:8] = struct.pack("ff", float(bpct), float(vbat))
+    except Exception:
+        pass
 
     # ---------- Wi-Fi + HTTP session ----------
     print("Connecting Wi-Fi…")
@@ -680,7 +719,7 @@ try:
             {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
             {"key": "sensor-id",   "value": sensor_id},
             {"key": "sensor-type", "value": sensor_type},
-            {"key": "fw-version",  "value": "1.0.6"},
+            {"key": "fw-version",  "value": "1.0.7"},
 
             # --- Environment (corrected) ---
             {"key": "temperature-c",         "value": round(t_c, 2)},
