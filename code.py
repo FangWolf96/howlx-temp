@@ -28,6 +28,12 @@
 #     • Added VOC/Gas IAQ interpretation layer for BME680 (1–5 index + label)
 #     • Added IAQ values to console logs, AIO feeds, and InfluxDB fields
 #     • Maintains backward compatibility on boards without gas sensors
+# # 2025-11-22 v1.0.9:
+#     • Added 10-sample / 10-second gas-resistance averaging for BME680
+#     • Added ESPHome-style humidity-compensated VOC metric ("comp_gas")
+#     • Added comp_gas to console logs, Adafruit IO feeds, and InfluxDB fields
+#     • Improved IAQ printout structure (Gas Ω, IAQ label/index, comp_gas)
+#     • Stabilizes VOC readings by delaying air-quality evaluation until after heater warm-up
 
 import time, math, ssl, struct, supervisor, json
 import board
@@ -418,8 +424,46 @@ try:
             )
 
     temp_c, rh, pressure_hpa, alt_m, gas_ohms = with_retry(_read_env_once, label=f"{sensor_type} read")
+    # --- IAQ GAS AVERAGING: 10 samples over 10 seconds ---
+    def sample_gas_iaq(sensor, samples=10, delay_s=1.0):
+        gas_vals = []
+        for i in range(samples):
+            try:
+                g = float(sensor.gas)
+                gas_vals.append(g)
+                print(f"[IAQ] sample {i+1}/{samples} = {g:.0f} Ω")
+            except Exception as e:
+                print("Gas read failed:", e)
+            time.sleep(delay_s)
+            feed_wdt()  # keep WDT alive
+        if not gas_vals:
+            return None
+        avg = sum(gas_vals) / len(gas_vals)
+        print(f"[IAQ] 10-second average = {avg:.0f} Ω")
+        return avg
+
+    # average gas measurement for IAQ
+    if sensor_type == "BME680":
+        gas_avg = sample_gas_iaq(_sensor_boot, samples=10, delay_s=1.0)
+        if gas_avg is not None:
+            gas_ohms = gas_avg
+    
     # Simple IAQ interpretation from gas resistance
     iaq_index, iaq_label = interpret_gas_resistance(gas_ohms)
+    # ----- ESPHome-style humidity-compensated IAQ metric -----
+    import math
+    def compute_comp_gas(gas_ohms, rh):
+        """
+        comp_gas = log(R_gas) + 0.04 * RH
+        Higher = cleaner air. Lower = more VOC.
+        """
+        if gas_ohms is None or gas_ohms <= 0:
+            return None
+        try:
+            return math.log(gas_ohms) + 0.04 * rh
+        except Exception:
+            return None
+    
 
     # ---- Offsets: load & stash raw readings ----
     t_raw = float(temp_c)
@@ -435,6 +479,8 @@ try:
 
     # Psychrometrics: if no pressure, use sea-level for derived calcs only
     p_for_calc = p_h if p_h is not None else SEA_LEVEL_HPA
+    # Compute ESPHome-style IAQ compensation
+    comp_gas = compute_comp_gas(gas_ohms, rh)
 
     temp_f = t_c * 9/5 + 32
     dp_c   = dewpoint_c(t_c, rh)
@@ -460,6 +506,8 @@ try:
         print(f"Gas: {gas_ohms:.0f} Ω")
         if iaq_index is not None:
             print(f"Air Quality: {iaq_label} (level {iaq_index}/5)")
+    if comp_gas is not None:
+        print(f"IAQ (comp_gas): {comp_gas:.2f}")
     print(f"Humidity Ratio: {w:.5f} kg/kg")
     print(f"Enthalpy: {h:.2f} kJ/kg")
     print("========================")
@@ -605,6 +653,9 @@ try:
             if iaq_index is not None:
                 fields.append("gas_iaq_index=%di" % int(iaq_index))
                 fields.append("gas_iaq_label=%s" % _lp_qstr(iaq_label))
+                if comp_gas is not None:
+                    fields.append("gas_iaq_comp=%.2f" % float(comp_gas))
+                
 
         fields.append("battery_v=%.3f" % (vbat,))
         fields.append("battery_pct=%.1f" % (bpct,))
@@ -800,6 +851,9 @@ try:
             if iaq_index is not None:
                 feeds.append({"key": "gas-iaq-index", "value": int(iaq_index)})
                 feeds.append({"key": "gas-iaq-label", "value": iaq_label})
+                if comp_gas is not None:
+                    feeds.append({"key": "gas-iaq-comp", "value": round(comp_gas, 2)})
+                
 
         # --- Battery ---
         feeds += [
