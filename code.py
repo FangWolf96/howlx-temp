@@ -1,17 +1,33 @@
-# HowlX Atmos Sensor v1.0.7 — HowlX proto board (Feather ESP32-S2 + BME280/SHT3x + MAX17048)
-# - Reads BME280/SHT3x environmental sensors (0x76/0x77/0x44)
+# HowlX Atmos Sensor v1.0.8 — HowlX proto board (Feather ESP32-S2/S3 + BME280/BME680/SHT3x + MAX17048)
+# - Reads BME280/SHT3x/BME680 environmental sensors (0x76/0x77/0x44)
 # - Reads MAX17048 fuel gauge (0x36)
 # - Posts to Adafruit IO Group (batch)
 # - Infers charging/discharging/charged and persists last %/V across deep sleep
-# - 2025-08-26 v1.0.1: Exception handling, watchdog, retries
-# -            v1.0.2: Add calibration support and read for offset file
-# -            v1.0.3: Offset file fallback fetch (GitHub)
-# - 2025-08-27 v1.0.4: Add Influx DB Support
-# -            v1.0.5: Apply bugfix to correct NameError when no global bme280 defined
-# -             Example – ESP32-S2 with no onboard BME280
-# - 2025-10-20 v1.0.6: Add BME680 + SHT3x support, board detection, fw-version tagging, and improved telemetry identification
-# - 2025-10-21 v1.0.7: Improved MAX17048 handling (dual-sample average, dual-API quick_start, USB detection, and charge inference)
-
+#
+# Version history:
+# 2025-08-26 v1.0.1:
+#     • Exception handling, watchdog, retries
+# 2025-08-26 v1.0.2:
+#     • Add calibration support and read for offset file
+# 2025-08-26 v1.0.3:
+#     • Offset file fallback fetch (GitHub)
+# 2025-08-27 v1.0.4:
+#     • Add Influx DB Support
+# 2025-08-27 v1.0.5:
+#     • Correct NameError when no global bme280 is defined
+#     • Supports ESP32-S2 boards with no onboard BME280
+# 2025-10-20 v1.0.6:
+#     • Add BME680 & SHT3x support
+#     • Board detection
+#     • FW-version tagging
+#     • Improved telemetry identification
+# 2025-10-21 v1.0.7:
+#     • Improved MAX17048 handling (dual-sample average, dual-API quick_start)
+#     • USB/VBUS detection and improved charge inference
+# 2025-11-21 v1.0.8:
+#     • Added VOC/Gas IAQ interpretation layer for BME680 (1–5 index + label)
+#     • Added IAQ values to console logs, AIO feeds, and InfluxDB fields
+#     • Maintains backward compatibility on boards without gas sensors
 
 import time, math, ssl, struct, supervisor, json
 import board
@@ -323,6 +339,40 @@ def humidity_ratio(temp_c, rh, pressure_hpa=1013.25):
 def enthalpy(temp_c, w):
     return 1.006 * temp_c + w * (2501 + 1.805 * temp_c)  # kJ/kg dry air
 
+# ---------- Gas / IAQ helpers ----------
+def interpret_gas_resistance(gas_ohms):
+    """
+    Very lightweight VOC / air-quality heuristic based only on gas resistance.
+    Returns (index, label) where index is 1..5 (1 = bad, 5 = very clean).
+
+    This is NOT Bosch BSEC, just a rough trend indicator:
+      >15kΩ  => 5  "very clean"
+      8k–15k => 4  "clean"
+      3k–8k  => 3  "light VOCs"
+      1k–3k  => 2  "moderate VOCs"
+      <1k    => 1  "high VOCs"
+    """
+    if gas_ohms is None:
+        return None, None
+    try:
+        g = float(gas_ohms)
+    except Exception:
+        return None, None
+    if g <= 0:
+        return None, None
+
+    if g >= 15000:
+        return 5, "very clean"
+    elif g >= 8000:
+        return 4, "clean"
+    elif g >= 3000:
+        return 3, "light VOCs"
+    elif g >= 1000:
+        return 2, "moderate VOCs"
+    else:
+        return 1, "high VOCs"
+
+
 try:
     # ---------- Unified read (before Wi-Fi) ----------
     if not _sensor_boot:
@@ -368,6 +418,8 @@ try:
             )
 
     temp_c, rh, pressure_hpa, alt_m, gas_ohms = with_retry(_read_env_once, label=f"{sensor_type} read")
+    # Simple IAQ interpretation from gas resistance
+    iaq_index, iaq_label = interpret_gas_resistance(gas_ohms)
 
     # ---- Offsets: load & stash raw readings ----
     t_raw = float(temp_c)
@@ -406,6 +458,8 @@ try:
         print("Pressure: n/a (no pressure sensor)")
     if gas_ohms is not None:
         print(f"Gas: {gas_ohms:.0f} Ω")
+        if iaq_index is not None:
+            print(f"Air Quality: {iaq_label} (level {iaq_index}/5)")
     print(f"Humidity Ratio: {w:.5f} kg/kg")
     print(f"Enthalpy: {h:.2f} kJ/kg")
     print("========================")
@@ -548,6 +602,9 @@ try:
                 fields.append("altitude_m=%.2f" % (alt_m,))
         if gas_ohms is not None:
             fields.append("gas_ohms=%di" % int(gas_ohms))
+            if iaq_index is not None:
+                fields.append("gas_iaq_index=%di" % int(iaq_index))
+                fields.append("gas_iaq_label=%s" % _lp_qstr(iaq_label))
 
         fields.append("battery_v=%.3f" % (vbat,))
         fields.append("battery_pct=%.1f" % (bpct,))
@@ -740,6 +797,9 @@ try:
 
         if gas_ohms is not None:
             feeds.append({"key": "gas-ohms", "value": int(gas_ohms)})
+            if iaq_index is not None:
+                feeds.append({"key": "gas-iaq-index", "value": int(iaq_index)})
+                feeds.append({"key": "gas-iaq-label", "value": iaq_label})
 
         # --- Battery ---
         feeds += [
