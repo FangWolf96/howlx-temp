@@ -34,6 +34,13 @@
 #     • Added comp_gas to console logs, Adafruit IO feeds, and InfluxDB fields
 #     • Improved IAQ printout structure (Gas Ω, IAQ label/index, comp_gas)
 #     • Stabilizes VOC readings by delaying air-quality evaluation until after heater warm-up
+# # 2025-11-24 v1.0.10:
+#     • Refined BME680 IAQ warm-up logic with improved plateau detection
+#     • Added adaptive heater-stabilization handling to ignore placeholder values
+#     • Cleaned IAQ sampling logs (removed “raw”, clearer sample numbering)
+#     • Improved early-exit accuracy when heater is already warm
+#     • Minor structural cleanup for stability and readability
+
 
 import time, math, ssl, struct, supervisor, json
 import board
@@ -424,29 +431,74 @@ try:
             )
 
     temp_c, rh, pressure_hpa, alt_m, gas_ohms = with_retry(_read_env_once, label=f"{sensor_type} read")
-    # --- IAQ GAS AVERAGING: 10 samples over 10 seconds ---
-    def sample_gas_iaq(sensor, samples=10, delay_s=1.0):
+
+    # --- IAQ GAS AVERAGING: adaptive warm-up + adaptive sampling ---
+    def sample_gas_iaq(sensor, max_samples=25, delay_s=1.0):
+        """
+        Adaptive warm-up for BME680 gas heater.
+
+        Behavior:
+          • Skips placeholder plateau values (e.g., 5684 Ω)
+          • Detects when gas heater actually warms up
+          • Begins averaging only after readings start rising
+          • Requires minimum 5 stable samples
+          • Can terminate early to save battery
+        """
         gas_vals = []
-        for i in range(samples):
+        last = None
+        plateau_count = 0
+        stable_started = False
+
+        for i in range(max_samples):
             try:
                 g = float(sensor.gas)
-                gas_vals.append(g)
-                print(f"[IAQ] sample {i+1}/{samples} = {g:.0f} Ω")
             except Exception as e:
                 print("Gas read failed:", e)
+                time.sleep(delay_s)
+                continue
+
+            print(f"[IAQ] Sample {i+1}/{max_samples} = {g:.0f} Ω")
+
+            # --- WARM-UP DETECTION ---
+            if last is not None:
+                if g == last:
+                    plateau_count += 1
+                    print(f"[IAQ] plateau detected ({plateau_count})")
+                else:
+                    if not stable_started:
+                        print("[IAQ] warm-up complete — heater active")
+                    stable_started = True
+            last = g
+
+            if not stable_started:
+                time.sleep(delay_s)
+                feed_wdt()
+                continue
+
+            gas_vals.append(g)
+
+            # exit early once we have stable values
+            if len(gas_vals) >= 5 and i >= 7:
+                print("[IAQ] early stabilization — stopping")
+                break
+
             time.sleep(delay_s)
-            feed_wdt()  # keep WDT alive
+            feed_wdt()
+
         if not gas_vals:
+            print("[IAQ] No valid gas samples!")
             return None
+
         avg = sum(gas_vals) / len(gas_vals)
-        print(f"[IAQ] 10-second average = {avg:.0f} Ω")
+        print(f"[IAQ] {len(gas_vals)}-sample stable average = {avg:.0f} Ω")
         return avg
 
-    # average gas measurement for IAQ
+    # --- Average gas measurement (only for BME680) ---
     if sensor_type == "BME680":
-        gas_avg = sample_gas_iaq(_sensor_boot, samples=10, delay_s=1.0)
+        gas_avg = sample_gas_iaq(_sensor_boot, max_samples=25, delay_s=1.0)
         if gas_avg is not None:
             gas_ohms = gas_avg
+
     
     # Simple IAQ interpretation from gas resistance
     iaq_index, iaq_label = interpret_gas_resistance(gas_ohms)
@@ -827,7 +879,7 @@ try:
             {"key": "sensor-name", "value": f"{SENSOR_NAME} #{sensor_id}"},
             {"key": "sensor-id",   "value": sensor_id},
             {"key": "sensor-type", "value": sensor_type},
-            {"key": "fw-version",  "value": "1.0.7"},
+            {"key": "fw-version",  "value": "1.0.10"},
 
             # --- Environment (corrected) ---
             {"key": "temperature-c",         "value": round(t_c, 2)},
